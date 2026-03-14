@@ -1552,6 +1552,14 @@ def main():
             else:
                 json.dump(records, f, indent=2, ensure_ascii=False)
 
+    def _extract_success_config(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(result, dict):
+            return None
+        config = result.get("config")
+        if not result.get("success") or not isinstance(config, dict):
+            return None
+        return dict(config)
+
     all_records: List[Dict[str, Any]] = []
 
     # 复用 automation（减少反复初始化配置），但每次仍会启动新的 browser
@@ -1628,8 +1636,9 @@ def main():
         if (count == 1) or bool(args.save_each):
             output_file = os.path.join(out_dir, f"exa_account_{email.split('@')[0]}_{int(time.time())}.json")
             try:
+                single_output = _extract_success_config(raw_result) or raw_result
                 with open(output_file, "w", encoding="utf-8") as f:
-                    json.dump(raw_result, f, indent=2, ensure_ascii=False)
+                    json.dump(single_output, f, indent=2, ensure_ascii=False)
                 _log("success", f"账户信息已保存到: {output_file}")
             except Exception as e:
                 _log("warning", f"保存单账号 JSON 失败: {e}")
