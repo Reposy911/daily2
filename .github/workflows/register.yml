@@ -4,11 +4,6 @@ on:
   schedule:
     - cron: '*/40 * * * *'
   workflow_dispatch:
-    inputs:
-      count:
-        description: '本次注册数量'
-        required: false
-        default: '40'
 
 jobs:
   register:
@@ -27,28 +22,20 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Install Chrome
+        run: python -m playwright install chromium
 
       - name: Run registration
-        env:
-          REG_COUNT: ${{ github.event.inputs.count || '40' }}
         run: |
-          mkdir -p codex
-          for i in $(seq 1 $REG_COUNT); do
-            echo "========== 第 $i/$REG_COUNT 次注册 =========="
-            python task_runner.py --once || true
-            if [ "$i" -lt "$REG_COUNT" ]; then
-              SLEEP=$((RANDOM % 20 + 10))
-              echo "[*] 等待 ${SLEEP}s..."
-              sleep $SLEEP
-            fi
-          done
+          mkdir -p exak
+          python task_runner.py --50 || true
 
       - name: Upload tokens
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tokens-${{ github.run_number }}-${{ github.run_attempt }}
-          path: codex/
+          name: exa_account-${{ github.run_number }}-${{ github.run_attempt }}
+          path: exak/
           retention-days: 7
           if-no-files-found: ignore
 
@@ -57,15 +44,17 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # 最多发送多少个 JSON 给机器人（避免产出太多导致限流）
+          TG_SEND_LIMIT: "10"
         run: |
           if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
             echo "Telegram secrets not set, skipping notification"
             exit 0
           fi
 
-          COUNT=$(find codex -name '*.json' 2>/dev/null | wc -l)
+          COUNT=$(find exak -name '*.json' 2>/dev/null | wc -l)
           if [ "$COUNT" -gt 0 ]; then
-            FILES=$(ls -1 codex/*.json 2>/dev/null | head -10 | while read f; do
+            FILES=$(ls -1 exak/*.json 2>/dev/null | head -10 | while read f; do
               EMAIL=$(python3 -c "import json; d=json.load(open('$f')); print(d.get('email','?'))" 2>/dev/null || echo "?")
               echo "  ✅ $EMAIL"
             done)
@@ -80,13 +69,25 @@ jobs:
             -d "parse_mode=Markdown" \
             -d "disable_web_page_preview=true" || true
 
-          # 打包并发送所有生成的 JSON 文件
+          # 逐个发送原始 JSON 文件给机器人（不再打 zip）
           if [ "$COUNT" -gt 0 ]; then
-            ZIP_NAME="tokens_$(date +%Y%m%d_%H%M%S).zip"
-            zip -r "$ZIP_NAME" codex/*.json
-            
-            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
-              -F "chat_id=${TG_CHAT_ID}" \
-              -F "document=@$ZIP_NAME" \
-              -F "caption=📦 本次运行产出的账户打包 (共 ${COUNT} 个)" || true
+            SENT=0
+            LIMIT=${TG_SEND_LIMIT:-10}
+            for f in exak/*.json; do
+              [ -e "$f" ] || continue
+              SENT=$((SENT + 1))
+              if [ "$SENT" -gt "$LIMIT" ]; then
+                echo "Reached TG_SEND_LIMIT=$LIMIT, stop sending more files."
+                break
+              fi
+
+              BASENAME=$(basename "$f")
+              curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
+                -F "chat_id=${TG_CHAT_ID}" \
+                -F "document=@$f" \
+                -F "caption=📄 ${BASENAME} (${SENT}/${COUNT})" || true
+
+              # 轻微延迟避免触发 Telegram 限流
+              sleep 1
+            done
           fi
