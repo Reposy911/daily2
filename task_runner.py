@@ -1552,6 +1552,15 @@ def main():
             else:
                 json.dump(records, f, indent=2, ensure_ascii=False)
 
+    def _extract_success_config_from_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(record, dict) or not record.get("success"):
+            return None
+        raw = record.get("raw") if isinstance(record.get("raw"), dict) else {}
+        config = raw.get("config") if isinstance(raw, dict) else None
+        if isinstance(config, dict):
+            return dict(config)
+        return None
+
     def _extract_success_config(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not isinstance(result, dict):
             return None
@@ -1646,8 +1655,13 @@ def main():
     # 写入聚合文件（count>1 默认输出；count==1 仅在显式指定 --output 或 --jsonl 时输出）
     if output_path:
         try:
-            success_records = [row for row in all_records if row.get("success")]
-            _save_aggregate(success_records, output_path, jsonl=bool(args.jsonl) or output_path.lower().endswith(".jsonl"))
+            # 聚合输出必须是 Exa2api 可识别的账号配置数组（即 config 对象数组）
+            success_configs: List[Dict[str, Any]] = []
+            for row in all_records:
+                cfg = _extract_success_config_from_record(row)
+                if cfg:
+                    success_configs.append(cfg)
+            _save_aggregate(success_configs, output_path, jsonl=bool(args.jsonl) or output_path.lower().endswith(".jsonl"))
             _log("success", f"\n聚合结果已保存到: {_display_path(output_path)}")
         except Exception as e:
             _log("error", f"聚合结果保存失败: {e}")
@@ -1655,8 +1669,12 @@ def main():
         # 理论上不会走到这里（count>1 会自动生成 output_path），兜底
         fallback = os.path.join(out_dir, f"exa_accounts_{int(time.time())}.json")
         try:
-            success_records = [row for row in all_records if row.get("success")]
-            _save_aggregate(success_records, fallback, jsonl=False)
+            success_configs: List[Dict[str, Any]] = []
+            for row in all_records:
+                cfg = _extract_success_config_from_record(row)
+                if cfg:
+                    success_configs.append(cfg)
+            _save_aggregate(success_configs, fallback, jsonl=False)
             _log("success", f"\n聚合结果已保存到: {_display_path(fallback)}")
         except Exception as e:
             _log("error", f"聚合结果保存失败: {e}")
