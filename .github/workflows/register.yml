@@ -54,11 +54,7 @@ jobs:
 
           COUNT=$(find exak -name '*.json' 2>/dev/null | wc -l)
           if [ "$COUNT" -gt 0 ]; then
-            FILES=$(ls -1 exak/*.json 2>/dev/null | head -10 | while read f; do
-              EMAIL=$(python3 -c "import json; d=json.load(open('$f')); print(d.get('email','?'))" 2>/dev/null || echo "?")
-              echo "  ✅ $EMAIL"
-            done)
-            MSG="🤖 *Daily Task Job*%0A%0A🎉 成功获取 ${COUNT} 个结果:%0A${FILES}%0A%0ARun: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            MSG="🤖 *Daily Task Job*%0A%0A📎 本次产出 ${COUNT} 个结果，文件将逐个发送。"
           else
             MSG="🤖 *Daily Task Job*%0A%0A❌ 本次无产出%0A%0ARun: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
           fi
