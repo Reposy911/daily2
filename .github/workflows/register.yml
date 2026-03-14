@@ -28,7 +28,7 @@ jobs:
       - name: Run registration
         run: |
           mkdir -p exak
-          python task_runner.py --50 || true
+          python task_runner.py --count 50 || true
 
       - name: Upload tokens
         if: always()
