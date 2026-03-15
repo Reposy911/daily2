@@ -22,13 +22,11 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Install Chrome
-        run: python -m playwright install chromium
 
       - name: Run registration
         run: |
           mkdir -p exak
-          python task_runner.py --count 50 || true
+          python task_runner.py --50 || true
 
       - name: Upload tokens
         if: always()
@@ -54,16 +52,19 @@ jobs:
 
           COUNT=$(find exak -name '*.json' 2>/dev/null | wc -l)
           if [ "$COUNT" -gt 0 ]; then
-            MSG="🤖 *Daily Task Job*%0A%0A📎 本次产出 ${COUNT} 个结果，文件将逐个发送。"
+            # 有产出时不发送文字消息，直接发送文件
+            MSG=""
           else
             MSG="🤖 *Daily Task Job*%0A%0A❌ 本次无产出%0A%0ARun: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
           fi
 
-          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TG_CHAT_ID}" \
-            -d "text=${MSG}" \
-            -d "parse_mode=Markdown" \
-            -d "disable_web_page_preview=true" || true
+          if [ "$COUNT" -eq 0 ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=${TG_CHAT_ID}" \
+              -d "text=${MSG}" \
+              -d "parse_mode=Markdown" \
+              -d "disable_web_page_preview=true" || true
+          fi
 
           # 逐个发送原始 JSON 文件给机器人（不再打 zip）
           if [ "$COUNT" -gt 0 ]; then
