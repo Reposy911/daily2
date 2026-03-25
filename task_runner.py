@@ -1,40 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ExaFree Exa 账号独立注册脚本（单文件版本）
-集成了所有邮箱验证码获取逻辑，支持多个邮箱提供商
-使用方法：
-   python standalone_exa_register_unified.py [--provider duckmail] [--coupon CODE]
+ExaFree Exa 账号独立注册脚本（单文件版）
+仅保留 Mailfree 邮箱后端与 Exa 自动化流程。
+
 环境变量：
-   EXA_PROXY=http://ip:port
-   COUPON=coupon-code
-   MAIL_PROVIDER=duckmail|dropmail|1secmail|tempmailfree|mailtm|mailgw|imap
+  EXA_PROXY=http://ip:port
+  COUPON=coupon-code
+  EXA_COUNT=1
+  EXA_OUTPUT_DIR=exak
 """
 
+from __future__ import annotations
+
+import argparse
 import json
 import os
 import re
 import sys
 import time
-import uuid
-import random
-import string
-import secrets
-import hashlib
-import base64
-import threading
-import argparse
-import imaplib
-import email as email_lib
 import urllib.parse
-import urllib.request
-import urllib.error
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional, List, Tuple
-from urllib.parse import urlparse, parse_qs, urlencode, quote
-from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
-# 配置编码支持，避免 Windows 终端编码问题
 try:
     sys.stdout.reconfigure(errors="replace")
 except Exception:
@@ -45,66 +34,38 @@ except Exception:
     pass
 
 try:
-    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright  # type: ignore
 except Exception:
     sync_playwright = None
-    PlaywrightTimeoutError = Exception
 
-# playwright-stealth（可选，用于降低 headless/CI 环境下的自动化检测概率）
 try:
-    from playwright_stealth import stealth_sync
+    from playwright_stealth import stealth_sync  # type: ignore
 except Exception:
     stealth_sync = None
 
 try:
-    from curl_cffi import requests
+    from curl_cffi import requests  # type: ignore
     HAS_CURL_CFFI = True
 except ImportError:
-    import requests
+    import requests  # type: ignore
     HAS_CURL_CFFI = False
 
-
-# ==========================================
-# 正则表达式和常量
-# ==========================================
 
 UUID_RE = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
     flags=re.IGNORECASE,
 )
+CODE_REGEX = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 
-# 验证码正则
-CODE_REGEX = r"(?<!\d)(\d{6})(?!\d)"
-MAILTM_BASE = "https://api.mail.tm"
-MAILGW_BASE = "https://api.mail.gw"
-TEMPMAILFREE_BASE = "https://api.temp-mail.solutions"
-TEMP_MAIL_PROVIDER_ORDER = ["mailtm", "mailgw", "1secmail", "tempmailfree", "dropmail"]
+DEFAULT_WORKER_URL = os.getenv("MF_WORKER_URL", "").strip()
+DEFAULT_MF_USER = os.getenv("MF_USER", "").strip()
+DEFAULT_MF_PASS = os.getenv("MF_PASS", "").strip()
 
-# 某些临时邮箱域名可能在目标站点不可用/收不到信，可在这里禁用
-# 也可用环境变量追加禁用：set MAIL_DOMAIN_BLOCKLIST=foo.com,bar.com
-_MAIL_DOMAIN_BLOCKLIST_ENV = os.getenv("MAIL_DOMAIN_BLOCKLIST", "").strip()
-MAIL_DOMAIN_BLOCKLIST: set[str] = {
-    "dollicons.com",
-}
-if _MAIL_DOMAIN_BLOCKLIST_ENV:
-    for _d in _MAIL_DOMAIN_BLOCKLIST_ENV.split(","):
-        _dd = (_d or "").strip().lower()
-        if _dd:
-            MAIL_DOMAIN_BLOCKLIST.add(_dd)
-
-# Exa 邮件 OTP 的发件人/内容关键词（可用环境变量覆盖）
-# 例如：set OTP_KEYWORDS=exa,verification
 _OTP_KEYWORDS_ENV = os.getenv("OTP_KEYWORDS", "exa").strip()
 OTP_KEYWORDS: List[str] = [k.strip().lower() for k in _OTP_KEYWORDS_ENV.split(",") if k.strip()]
 
 
-# ==========================================
-# 日志和工具函数
-# ==========================================
-
 def _log(level: str, message: str) -> None:
-    """打印日志"""
     timestamp = datetime.now().strftime("%H:%M:%S")
     if level == "info":
         print(f"[{timestamp}] [INFO] {message}")
@@ -135,17 +96,9 @@ def _parse_blocked_resource_types() -> set[str]:
 
 
 def _build_playwright_proxy(proxy_url: str) -> Optional[Dict[str, str]]:
-    """把形如 http://user:pass@host:port 的代理串解析为 Playwright proxy dict。
-
-    Playwright 更稳定的写法是：
-      {server: "http://host:port", username: "user", password: "pass"}
-    而不是把 user/pass 拼进 server。
-    """
     proxy_url = (proxy_url or "").strip()
     if not proxy_url:
         return None
-
-    # 补齐协议
     if "://" not in proxy_url:
         proxy_url = f"http://{proxy_url}"
 
@@ -157,11 +110,7 @@ def _build_playwright_proxy(proxy_url: str) -> Optional[Dict[str, str]]:
     if not (p.scheme and p.hostname):
         return {"server": proxy_url}
 
-    scheme = p.scheme
-    # Playwright 使用 socks5（不识别 socks5h）
-    if scheme == "socks5h":
-        scheme = "socks5"
-
+    scheme = "socks5" if p.scheme == "socks5h" else p.scheme
     server = f"{scheme}://{p.hostname}"
     if p.port:
         server += f":{p.port}"
@@ -175,670 +124,151 @@ def _build_playwright_proxy(proxy_url: str) -> Optional[Dict[str, str]]:
 
 
 def extract_verification_code(content: str) -> Optional[str]:
-    """从邮件内容中提取验证码"""
     if not content:
         return None
-    m = re.search(CODE_REGEX, content or "")
+    m = CODE_REGEX.search(content)
     return m.group(1) if m else None
 
 
-def _match_keywords(sender: str, content: str, keywords: Optional[List[str]] = None) -> bool:
-    """用于过滤目标邮件（默认匹配 OTP_KEYWORDS）。keywords 为空则不做过滤。"""
-    keys = OTP_KEYWORDS if keywords is None else keywords
-    if not keys:
+def _match_keywords(sender: str, subject: str, content: str) -> bool:
+    if not OTP_KEYWORDS:
         return True
-    blob = (sender or "") + "\n" + (content or "")
-    blob = blob.lower()
-    return any(k in blob for k in keys)
+    blob = "\n".join([sender or "", subject or "", content or ""]).lower()
+    return any(k in blob for k in OTP_KEYWORDS)
 
 
-def request_with_proxy_fallback(func, *args, proxies=None, **kwargs):
-    """使用代理发送请求，失败时回退到无代理"""
-    try:
-        return func(*args, proxies=proxies, **kwargs)
-    except Exception as e:
-        if proxies:
-            _log("warning", f"代理请求失败，尝试无代理: {e}")
-            try:
-                return func(*args, proxies=None, **kwargs)
-            except Exception as e2:
-                raise e2
-        raise
+def _normalize_proxy(proxy: str) -> str:
+    proxy = (proxy or "").strip()
+    if not proxy:
+        return ""
+    if "://" in proxy:
+        return proxy
+    if proxy.endswith(":1080"):
+        return f"socks5h://{proxy}"
+    return f"http://{proxy}"
 
 
-# ==========================================
-# Mail.tm / Mail.gw API 实现
-# ==========================================
-
-def _mailtm_headers(*, token: str = "", use_json: bool = False) -> Dict[str, str]:
-    headers = {"Accept": "application/json"}
-    if use_json:
-        headers["Content-Type"] = "application/json"
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
+def _new_http_session(proxies: Optional[Dict[str, str]] = None):
+    if HAS_CURL_CFFI:
+        return requests.Session(proxies=proxies, impersonate="chrome")
+    s = requests.Session()
+    if proxies:
+        s.proxies.update(proxies)
+    return s
 
 
-def _mailtm_domains(proxies: Any = None, base_url: str = MAILTM_BASE) -> list:
-    """获取 Mail.tm 可用域名"""
-    try:
-        if HAS_CURL_CFFI:
-            resp = requests.get(
-                f"{base_url}/domains",
-                headers=_mailtm_headers(),
-                proxies=proxies,
-                impersonate="chrome",
-                timeout=15,
-            )
-        else:
-            resp = requests.get(
-                f"{base_url}/domains",
-                headers=_mailtm_headers(),
-                proxies=proxies,
-                timeout=15,
-            )
-        
-        if resp.status_code != 200:
-            return []
-
-        data = resp.json()
-        domains = []
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            items = data.get("hydra:member") or data.get("items") or []
-        else:
-            items = []
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            domain = str(item.get("domain") or "").strip()
-            is_active = item.get("isActive", True)
-            is_private = item.get("isPrivate", False)
-            if domain and is_active and not is_private:
-                if domain.lower() in MAIL_DOMAIN_BLOCKLIST:
-                    continue
-                domains.append(domain)
-
-        return domains
-    except Exception as e:
-        _log("error", f"获取 Mail.tm 域名失败: {e}")
-        return []
+def _mailfree_login(base_url: str, username: str, password: str, proxies: Optional[Dict[str, str]] = None):
+    s = _new_http_session(proxies)
+    resp = s.post(
+        f"{base_url.rstrip('/')}/api/login",
+        json={"username": username, "password": password},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Mailfree 登录失败: HTTP {resp.status_code} {resp.text[:200]}")
+    return s
 
 
-def get_email_and_token_mailtm(proxies: Any = None, base_url: str = MAILTM_BASE) -> Tuple[str, str]:
-    """创建 Mail.tm / Mail.gw 邮箱并获取 Bearer Token（正确流程：/accounts 后再 /token）。"""
-    domains = _mailtm_domains(proxies, base_url)
-    if not domains:
-        _log("error", f"{base_url} 没有可用域名")
-        return "", ""
+def get_mailfree_email(
+    proxies: Optional[Dict[str, str]] = None,
+    base_url: str = DEFAULT_WORKER_URL,
+    mf_user: str = DEFAULT_MF_USER,
+    mf_pass: str = DEFAULT_MF_PASS,
+) -> Tuple[str, Any]:
+    if not base_url or not mf_user or not mf_pass:
+        raise RuntimeError("Mailfree 环境变量未配置完整：需要 MF_WORKER_URL / MF_USER / MF_PASS")
 
-    domain = random.choice(domains)
-    names = [
-        "james", "mary", "john", "patricia", "robert", "jennifer", "michael", "linda",
-        "william", "elizabeth", "david", "barbara", "richard", "susan", "joseph", "jessica",
-        "thomas", "sarah", "charles", "karen", "christopher", "nancy", "daniel", "lisa",
-        "matthew", "betty", "anthony", "margaret", "mark", "sandra", "donald", "ashley",
-        "steven", "kimberly", "paul", "emily", "andrew", "donna", "joshua", "michelle",
-        "alex", "chris", "katie", "brian", "kevin", "ryan", "eric", "jason", "justin",
-    ]
+    s = _mailfree_login(base_url, mf_user, mf_pass, proxies)
+    resp = s.get(f"{base_url.rstrip('/')}/api/generate", timeout=15)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Mailfree generate 失败: HTTP {resp.status_code} {resp.text[:200]}")
 
-    for _ in range(5):
-        local = f"{random.choice(names)}{secrets.token_hex(2)}"
-        email_addr = f"{local}@{domain}"
-        password = secrets.token_urlsafe(18)
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Mailfree generate 响应格式异常: {resp.text[:200]}")
 
-        try:
-            if HAS_CURL_CFFI:
-                create_resp = requests.post(
-                    f"{base_url}/accounts",
-                    headers=_mailtm_headers(use_json=True),
-                    json={"address": email_addr, "password": password},
-                    proxies=proxies,
-                    impersonate="chrome",
-                    timeout=15,
-                )
-            else:
-                create_resp = requests.post(
-                    f"{base_url}/accounts",
-                    headers=_mailtm_headers(use_json=True),
-                    json={"address": email_addr, "password": password},
-                    proxies=proxies,
-                    timeout=15,
-                )
-            if create_resp.status_code not in (200, 201):
-                continue
-
-            if HAS_CURL_CFFI:
-                token_resp = requests.post(
-                    f"{base_url}/token",
-                    headers=_mailtm_headers(use_json=True),
-                    json={"address": email_addr, "password": password},
-                    proxies=proxies,
-                    impersonate="chrome",
-                    timeout=15,
-                )
-            else:
-                token_resp = requests.post(
-                    f"{base_url}/token",
-                    headers=_mailtm_headers(use_json=True),
-                    json={"address": email_addr, "password": password},
-                    proxies=proxies,
-                    timeout=15,
-                )
-
-            if token_resp.status_code == 200:
-                token = str((token_resp.json() or {}).get("token") or "").strip()
-                if token:
-                    _log("success", f"Mail(tm/gw) 邮箱创建成功: {email_addr}")
-                    return email_addr, token
-        except Exception as e:
-            _log("warning", f"Mail(tm/gw) 创建邮箱尝试失败: {e}")
-
-    _log("error", f"{base_url} 邮箱创建成功但获取 Token 失败")
-    return "", ""
+    email_addr = (data.get("address") or data.get("email") or "").strip()
+    if not email_addr:
+        raise RuntimeError(f"Mailfree generate 未返回 address/email: {resp.text[:200]}")
+    return email_addr, s
 
 
-def get_oai_code_mailtm(email: str, token: str, proxies: Any = None, base_url: str = MAILTM_BASE) -> str:
-    """轮询邮箱验证码（Mail.tm / Mail.gw）。
-
-    注意：这里用于 Exa OTP，不再硬编码过滤 "openai"，改为按 OTP_KEYWORDS 过滤（默认: exa）。
-    """
-    url_list = f"{base_url}/messages"
+def get_exa_code_mailfree(
+    email_addr: str,
+    mf_session: Any,
+    proxies: Optional[Dict[str, str]] = None,
+    base_url: str = DEFAULT_WORKER_URL,
+    mf_user: str = DEFAULT_MF_USER,
+    mf_pass: str = DEFAULT_MF_PASS,
+    *,
+    poll_times: int = 50,
+    interval_sec: float = 3.0,
+) -> str:
+    s = mf_session or _mailfree_login(base_url, mf_user, mf_pass, proxies)
     seen_ids: set[str] = set()
-    _log("info", f"正在等待邮箱 {email} 的验证码...")
+    _log("info", f"正在等待 Mailfree 邮箱 {email_addr} 的验证码...")
 
-    for attempt in range(40):
+    for _ in range(max(1, int(poll_times))):
         try:
-            if HAS_CURL_CFFI:
-                resp = requests.get(
-                    url_list,
-                    headers=_mailtm_headers(token=token),
-                    proxies=proxies,
-                    impersonate="chrome",
-                    timeout=15,
-                )
-            else:
-                resp = requests.get(
-                    url_list,
-                    headers=_mailtm_headers(token=token),
-                    proxies=proxies,
-                    timeout=15,
-                )
-
+            resp = s.get(
+                f"{base_url.rstrip('/')}/api/emails",
+                params={"mailbox": email_addr, "limit": 20},
+                timeout=15,
+            )
             if resp.status_code != 200:
-                time.sleep(3)
+                time.sleep(interval_sec)
                 continue
 
-            data = resp.json()
-            if isinstance(data, list):
-                messages = data
-            elif isinstance(data, dict):
-                messages = data.get("hydra:member") or data.get("messages") or []
-            else:
+            messages = resp.json()
+            if isinstance(messages, dict):
+                messages = messages.get("list") or messages.get("data") or messages.get("emails") or []
+            if not isinstance(messages, list):
                 messages = []
 
             for msg in messages:
                 if not isinstance(msg, dict):
                     continue
-                msg_id = str(msg.get("id") or "").strip()
+                msg_id = str(msg.get("id") or msg.get("_id") or "").strip()
                 if not msg_id or msg_id in seen_ids:
                     continue
                 seen_ids.add(msg_id)
 
-                # 读详情
-                if HAS_CURL_CFFI:
-                    read_resp = requests.get(
-                        f"{base_url}/messages/{msg_id}",
-                        headers=_mailtm_headers(token=token),
-                        proxies=proxies,
-                        impersonate="chrome",
-                        timeout=15,
-                    )
-                else:
-                    read_resp = requests.get(
-                        f"{base_url}/messages/{msg_id}",
-                        headers=_mailtm_headers(token=token),
-                        proxies=proxies,
-                        timeout=15,
-                    )
-                if read_resp.status_code != 200:
+                detail_resp = s.get(f"{base_url.rstrip('/')}/api/email/{msg_id}", timeout=15)
+                if detail_resp.status_code != 200:
                     continue
 
-                mail_data = read_resp.json() or {}
-                sender = str(((mail_data.get("from") or {}).get("address") or "")).lower()
+                mail_raw = detail_resp.json()
+                mail_data = mail_raw.get("data") if (isinstance(mail_raw, dict) and "data" in mail_raw) else mail_raw
+                if not isinstance(mail_data, dict):
+                    continue
+
+                sender = str(mail_data.get("from") or mail_data.get("sender") or "").lower()
                 subject = str(mail_data.get("subject") or "")
-                intro = str(mail_data.get("intro") or "")
-                text = str(mail_data.get("text") or "")
-                html = mail_data.get("html") or ""
-                if isinstance(html, list):
-                    html = "\n".join(str(x) for x in html)
+                text = str(
+                    mail_data.get("text")
+                    or mail_data.get("body")
+                    or mail_data.get("content")
+                    or mail_data.get("body_text")
+                    or ""
+                )
+                html = str(mail_data.get("html") or mail_data.get("body_html") or "")
+                content = "\n".join([text, html])
 
-                content = "\n".join([subject, intro, text, str(html)])
-                if not _match_keywords(sender, content):
+                if not _match_keywords(sender, subject, content):
                     continue
 
-                code = extract_verification_code(content)
+                code = extract_verification_code("\n".join([subject, content]))
                 if code:
                     _log("success", f"找到验证码: {code}")
                     return code
-        except Exception as e:
-            _log("warning", f"轮询邮件失败 (尝试 {attempt + 1}/40): {e}")
+        except Exception:
+            pass
 
-        if attempt < 39:
-            time.sleep(3)
+        time.sleep(interval_sec)
 
-    _log("error", "超时，未收到验证码")
+    _log("error", "Mailfree 超时，未收到验证码")
     return ""
 
-
-# ==========================================
-# Dropmail.me GraphQL API
-# ==========================================
-
-def get_email_dropmail(proxies: Any = None) -> Tuple[str, str]:
-    """生成 Dropmail.me 邮箱，返回 (email, session_id)"""
-    pwd = secrets.token_hex(8)
-    query = """
-    mutation {
-        introduceSession {
-            id,
-            expiresAt,
-            addresses {
-                address
-            }
-        }
-    }
-    """
-    for _ in range(15):
-        try:
-            if HAS_CURL_CFFI:
-                resp = requests.post(
-                    "https://dropmail.me/api/graphql/web-test-wgq6m5i",
-                    json={"query": query},
-                    impersonate="chrome",
-                    timeout=15,
-                )
-            else:
-                resp = requests.post(
-                    "https://dropmail.me/api/graphql/web-test-wgq6m5i",
-                    json={"query": query},
-                    timeout=15,
-                )
-            
-            if resp.status_code == 200:
-                data = resp.json().get("data", {}).get("introduceSession", {})
-                session_id = data.get("id")
-                addresses = data.get("addresses", [])
-                if session_id and addresses:
-                    address = addresses[0]["address"]
-                    whitelist = ["mimimail.me", "pickmemail.com", "mailtowin.com", "maximail.vip", "maximail.fyi"]
-                    if not any(good in address for good in whitelist):
-                        continue
-                    _log("success", f"Dropmail 邮箱创建成功: {address}")
-                    return address, session_id
-        except Exception as e:
-            _log("warning", f"Dropmail 创建邮箱失败: {e}")
-            time.sleep(2)
-    
-    return "", ""
-
-
-def get_oai_code_dropmail(session_id: str, email: str, proxies: Any = None) -> str:
-    """使用 Dropmail Session 获取 OpenAI 验证码"""
-    query = """
-    query ($id: ID!) {
-        session(id: $id) {
-            mails {
-                rawSize
-                fromAddr
-                toAddr
-                downloadUrl
-                text
-                headerSubject
-            }
-        }
-    }
-    """
-    _log("info", f"正在等待 Dropmail 邮箱 {email} 的验证码...", )
-
-    for _ in range(4):
-        try:
-            if HAS_CURL_CFFI:
-                resp = requests.post(
-                    "https://dropmail.me/api/graphql/web-test-wgq6m5i",
-                    json={"query": query, "variables": {"id": session_id}},
-                    impersonate="chrome",
-                    timeout=15,
-                )
-            else:
-                resp = requests.post(
-                    "https://dropmail.me/api/graphql/web-test-wgq6m5i",
-                    json={"query": query, "variables": {"id": session_id}},
-                    timeout=15,
-                )
-            
-            if resp.status_code == 200:
-                data = resp.json().get("data", {}).get("session", {})
-                if not data:
-                    time.sleep(3)
-                    continue
-                
-                mails = data.get("mails", [])
-                for mail in mails:
-                    sender = str(mail.get("fromAddr") or "").lower()
-                    subject = str(mail.get("headerSubject") or "")
-                    text = str(mail.get("text") or "")
-                    
-                    content = "\n".join([subject, text])
-
-                    if not _match_keywords(sender, content):
-                        continue
-
-                    code = extract_verification_code(content)
-                    if code:
-                        _log("success", f"找到验证码: {code}")
-                        return code
-        except Exception as e:
-            _log("warning", f"Dropmail 轮询失败: {e}")
-
-        time.sleep(3)
-
-    _log("error", "Dropmail 超时，未收到验证码")
-    return ""
-
-
-# ==========================================
-# 1secmail 临时邮箱 API
-# ==========================================
-
-def _1secmail_domains(proxies: Any = None) -> list:
-    try:
-        if HAS_CURL_CFFI:
-            resp = requests.get(
-                "https://www.1secmail.com/api/v1/?action=getDomainList",
-                proxies=proxies,
-                impersonate="chrome",
-                timeout=15,
-            )
-        else:
-            resp = requests.get(
-                "https://www.1secmail.com/api/v1/?action=getDomainList",
-                proxies=proxies,
-                timeout=15,
-            )
-        
-        if resp.status_code == 200:
-            return resp.json()
-    except Exception:
-        pass
-    return ["1secmail.com", "1secmail.org", "1secmail.net", "kzccv.com", "qiott.com", "wukong.com", "icznn.com"]
-
-
-def get_email_1secmail(proxies: Any = None) -> Tuple[str, str]:
-    """生成 1secmail 邮箱"""
-    domains = _1secmail_domains(proxies)
-    if not domains:
-        _log("error", "未获取到 1secmail 域名")
-        return "", ""
-    domain = random.choice(domains)
-
-    names = [
-        "james", "mary", "john", "patricia", "robert", "jennifer", "michael", "linda",
-        "william", "elizabeth", "david", "barbara", "richard", "susan", "joseph", "jessica",
-    ]
-    name = random.choice(names)
-    local = f"{name}{secrets.token_hex(2)}"
-    email = f"{local}@{domain}"
-    
-    _log("success", f"1secmail 邮箱创建成功: {email}")
-    return email, "1secmail"
-
-
-def get_oai_code_1secmail(email: str, proxies: Any = None) -> str:
-    """使用 1secmail 邮箱轮询获取 OpenAI 验证码"""
-    login, domain = email.split("@")
-    url_list = f"https://www.1secmail.com/api/v1/?action=getMessages&login={login}&domain={domain}"
-    seen_ids = set()
-
-    _log("info", f"正在等待 1secmail 邮箱 {email} 的验证码...", )
-
-    for attempt in range(40):
-        try:
-            if HAS_CURL_CFFI:
-                resp = requests.get(
-                    url_list,
-                    proxies=proxies,
-                    impersonate="chrome",
-                    timeout=15,
-                )
-            else:
-                resp = requests.get(
-                    url_list,
-                    proxies=proxies,
-                    timeout=15,
-                )
-            
-            if resp.status_code != 200:
-                time.sleep(3)
-                continue
-
-            messages = resp.json()
-
-            for msg in messages:
-                if not isinstance(msg, dict):
-                    continue
-                msg_id = str(msg.get("id"))
-                if not msg_id or msg_id in seen_ids:
-                    continue
-                seen_ids.add(msg_id)
-
-                read_url = f"https://www.1secmail.com/api/v1/?action=readMessage&login={login}&domain={domain}&id={msg_id}"
-                try:
-                    if HAS_CURL_CFFI:
-                        read_resp = requests.get(
-                            read_url,
-                            proxies=proxies,
-                            impersonate="chrome",
-                            timeout=15,
-                        )
-                    else:
-                        read_resp = requests.get(
-                            read_url,
-                            proxies=proxies,
-                            timeout=15,
-                        )
-                except Exception:
-                    continue
-                
-                if read_resp.status_code != 200:
-                    continue
-
-                mail_data = read_resp.json()
-                sender = str(mail_data.get("from") or "").lower()
-                subject = str(mail_data.get("subject") or "")
-                text = str(mail_data.get("textBody") or "")
-                html = str(mail_data.get("htmlBody") or "")
-                
-                content = "\n".join([subject, text, html])
-
-                if not _match_keywords(sender, content):
-                    continue
-
-                code = extract_verification_code(content)
-                if code:
-                    _log("success", f"找到验证码: {code}")
-                    return code
-        except Exception as e:
-            _log("warning", f"1secmail 轮询失败 (尝试 {attempt+1}/40): {e}")
-
-        if attempt < 39:
-            time.sleep(3)
-
-    _log("error", "1secmail 超时，未收到验证码")
-    return ""
-
-
-# ==========================================
-# Temp-Mailfree API
-# ==========================================
-
-def get_email_temp_mailfree(proxies: Any = None) -> Tuple[str, str]:
-    """使用 Temp-Mailfree 生成随机邮箱"""
-    try:
-        url = f"{TEMPMAILFREE_BASE}/api/accounts/random"
-        
-        if proxies:
-            proxy_url = proxies.get("https") or proxies.get("http")
-            if proxy_url:
-                proxy_handler = urllib.request.ProxyHandler({'https': proxy_url, 'http': proxy_url})
-                opener = urllib.request.build_opener(proxy_handler)
-                urllib.request.install_opener(opener)
-        
-        req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-        
-        with urllib.request.urlopen(req, timeout=15) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            email = data.get("email", "")
-            token = data.get("token", "")
-            if email and token:
-                _log("success", f"Temp-Mailfree 邮箱创建成功: {email}")
-                return email, token
-    except Exception as e:
-        _log("error", f"Temp-Mailfree 创建邮箱失败: {e}")
-    return "", ""
-
-
-def get_oai_code_temp_mailfree(email: str, token: str, proxies: Any = None) -> str:
-    """使用 Temp-Mailfree 获取 OpenAI 验证码"""
-    _log("info", f"正在等待 Temp-Mailfree 邮箱 {email} 的验证码...", )
-
-    if proxies:
-        proxy_url = proxies.get("https") or proxies.get("http")
-        if proxy_url:
-            proxy_handler = urllib.request.ProxyHandler({'https': proxy_url, 'http': proxy_url})
-            opener = urllib.request.build_opener(proxy_handler)
-            urllib.request.install_opener(opener)
-
-    for attempt in range(40):
-        try:
-            url = f"{TEMPMAILFREE_BASE}/api/messages/{token}"
-            req = urllib.request.Request(url)
-            req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-            
-            with urllib.request.urlopen(req, timeout=15) as response:
-                messages = json.loads(response.read().decode('utf-8'))
-                
-                if isinstance(messages, list):
-                    for msg in messages:
-                        if not isinstance(msg, dict):
-                            continue
-                        
-                        sender = str(msg.get("from_name", "") or msg.get("from", "")).lower()
-                        subject = str(msg.get("subject", ""))
-                        text = str(msg.get("body_text", ""))
-                        html = str(msg.get("body_html", ""))
-                        
-                        content = "\n".join([subject, text, html])
-                        
-                        if not _match_keywords(sender, content):
-                            continue
-                        
-                        code = extract_verification_code(content)
-                        if code:
-                            _log("success", f"找到验证码: {code}")
-                            return code
-        except Exception as e:
-            _log("warning", f"Temp-Mailfree 轮询失败 (尝试 {attempt+1}/40): {e}")
-
-        if attempt < 39:
-            time.sleep(3)
-
-    _log("error", "Temp-Mailfree 超时，未收到验证码")
-    return ""
-
-
-# ==========================================
-# IMAP Catch-All 自建邮箱
-# ==========================================
-
-def get_email_imap(domain: str) -> Tuple[str, str]:
-    """生成自建域名邮箱"""
-    names = [
-        "james", "mary", "john", "patricia", "robert", "jennifer", "michael", "linda",
-    ]
-    name = random.choice(names)
-    local = f"{name}{secrets.token_hex(2)}"
-    email = f"{local}@{domain}"
-    _log("success", f"IMAP 邮箱生成成功: {email}")
-    return email, "imap"
-
-
-def get_oai_code_imap(
-    email: str,
-    imap_host: str,
-    imap_port: int = 993,
-    imap_user: str = "",
-    imap_password: str = ""
-) -> str:
-    """通过 IMAP 获取验证码"""
-    if not imap_user:
-        imap_user = email
-    
-    _log("info", f"正在通过 IMAP 连接 {imap_host} 获取验证码...")
-
-    try:
-        imap = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=15)
-        imap.login(imap_user, imap_password)
-        imap.select("INBOX")
-        
-        _, message_ids = imap.search(None, "ALL")
-        msg_ids = message_ids[0].split()
-        
-        # 按倒序（最新的邮件在前）查看邮件
-        for msg_id in reversed(msg_ids[-20:]):
-            try:
-                _, data = imap.fetch(msg_id, "(RFC822)")
-                msg = email_lib.message_from_bytes(data[0][1])
-                
-                sender = str(msg.get("From", "")).lower()
-                subject = str(msg.get("Subject", ""))
-                
-                # 提取邮件正文
-                body = ""
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        break
-                
-                content = f"{subject}\n{body}"
-                
-                if not _match_keywords(sender, content):
-                    continue
-                
-                code = extract_verification_code(content)
-                if code:
-                    _log("success", f"找到验证码: {code}")
-                    imap.close()
-                    imap.logout()
-                    return code
-            except Exception:
-                pass
-        
-        imap.close()
-        imap.logout()
-    except Exception as e:
-        _log("error", f"IMAP 连接失败: {e}")
-    
-    _log("error", "IMAP 超时，未收到验证码")
-    return ""
-
-
-# ==========================================
-# Exa 自动化流程
-# ==========================================
 
 class ExaAutomation:
     """Exa 自动化流程封装（同步）"""
@@ -865,57 +295,43 @@ class ExaAutomation:
         coupon_code: str = "",
         redeem_coupon: bool = False,
     ) -> Dict[str, Any]:
-        """执行 Exa 登录 + 初始化流程"""
         if sync_playwright is None:
             return {
                 "success": False,
                 "error": "playwright 未安装，请执行: pip install playwright && playwright install chromium",
             }
 
-        start_time = datetime.now()
         _log("info", f"打开 Exa 登录页: {email}")
 
         try:
             with sync_playwright() as p:
                 enable_stealth = _parse_bool_env("EXA_STEALTH", True)
-
-                launch_args = [
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ]
-                # 轻量反自动化参数（与 stealth 组合更有效）
+                launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
                 if enable_stealth:
                     launch_args.append("--disable-blink-features=AutomationControlled")
 
-                launch_kwargs = {
+                launch_kwargs: Dict[str, Any] = {
                     "headless": (not self.headed),
                     "args": launch_args,
                 }
-
                 if self.slow_mo_ms:
                     launch_kwargs["slow_mo"] = self.slow_mo_ms
 
                 browser = p.chromium.launch(**launch_kwargs)
 
-                # 代理：优先在 context 上设置（对带账号密码的 https proxy 更稳）
                 proxy_cfg = None
                 if self.proxy:
                     proxy_cfg = _build_playwright_proxy(self.proxy) or {"server": self.proxy}
-                    try:
-                        _log(
-                            "info",
-                            f"Playwright 代理: server={proxy_cfg.get('server','')} user={proxy_cfg.get('username','') or '(none)'}",
-                        )
-                    except Exception:
-                        pass
+                    _log(
+                        "info",
+                        f"Playwright 代理: server={proxy_cfg.get('server','')} user={proxy_cfg.get('username','') or '(none)'}",
+                    )
 
-                # 尽量模拟真实桌面环境指纹（对 CI/Linux 更友好）
                 default_ua = os.getenv(
                     "EXA_USER_AGENT",
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
                 )
-
-                context_kwargs = {
+                context_kwargs: Dict[str, Any] = {
                     "locale": os.getenv("EXA_LOCALE", "en-US"),
                     "timezone_id": os.getenv("EXA_TIMEZONE", "America/Los_Angeles"),
                     "user_agent": default_ua,
@@ -950,13 +366,11 @@ class ExaAutomation:
                         _log("warning", f"启用 playwright-stealth 失败（将继续执行）: {e}")
 
                 try:
-                    self._login_with_otp(page, email, code_getter_func, start_time)
+                    self._login_with_otp(page, email, code_getter_func)
                     onboarding_key = self._complete_onboarding(page)
-
-                    # 若仍停留在 onboarding 且没有拿到 key，说明未完成引导
                     if "onboarding" in (page.url or "") and not onboarding_key:
                         raise RuntimeError(f"onboarding 未完成，仍停留在: {page.url}")
-                    
+
                     balance = None
                     coupon_status = "not_attempted"
                     if redeem_coupon:
@@ -965,13 +379,13 @@ class ExaAutomation:
                     created_api_key = onboarding_key
                     if not created_api_key:
                         raise RuntimeError("未能在 onboarding 阶段提取到 API key")
+
                     account_config = self._build_account_config(
                         email=email,
                         api_key=created_api_key,
                         coupon_status=coupon_status,
                         balance=balance,
                     )
-
                     return {
                         "success": True,
                         "config": account_config,
@@ -993,8 +407,7 @@ class ExaAutomation:
             _log("error", f"Exa 自动化失败: {exc}")
             return {"success": False, "error": str(exc)}
 
-    def _login_with_otp(self, page, email: str, code_getter_func, start_time: datetime) -> None:
-        """使用验证码登录"""
+    def _login_with_otp(self, page, email: str, code_getter_func) -> None:
         auth_url = "https://auth.exa.ai/?callbackUrl=https%3A%2F%2Fdashboard.exa.ai%2F"
         page.goto(auth_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
 
@@ -1072,10 +485,7 @@ class ExaAutomation:
             page.wait_for_timeout(300)
 
         if not otp_ready and not entered_dashboard:
-            raise RuntimeError(
-                "提交邮箱后未进入验证码页。"
-                + _page_diag()
-            )
+            raise RuntimeError("提交邮箱后未进入验证码页。" + _page_diag())
 
         if entered_dashboard:
             _log("success", f"提交邮箱后已直接进入: {page.url}")
@@ -1111,16 +521,13 @@ class ExaAutomation:
         _log("success", f"OTP 验证成功，已进入: {page.url}")
 
     def _complete_onboarding(self, page) -> Optional[str]:
-        """完成新手引导"""
         onboarding_key = None
         self._safe_goto(page, "https://dashboard.exa.ai/onboarding", timeout=self.timeout_ms, retries=2)
         page.wait_for_timeout(1200)
 
-        # 调试/人工介入：卡在 onboarding 时可启用 Playwright Inspector 手动点选
-        # 用法：运行脚本时加 --headed --pause-onboarding
         if self.pause_onboarding:
             try:
-                _log("warning", "已开启 pause_onboarding：将暂停在 onboarding 页面，手动完成后在 Inspector 中继续执行")
+                _log("warning", "已开启 pause_onboarding：将暂停在 onboarding 页面，手动完成后继续执行")
                 page.pause()
             except Exception:
                 pass
@@ -1136,15 +543,12 @@ class ExaAutomation:
             'button:has-text("Proceed")',
             '[role="button"]:has-text("Proceed")',
         ]
-
-        # 按你的实际流程优先顺序：Codex -> Python -> Web search tool
         step1_choice_groups = [
             ["Codex", "Cursor", "Claude", "Devin", "Other"],
             ["Python", "OpenAI SDK", "JavaScript", "cURL", "MCP", "Other"],
             ["Web search tool", "Coding agent", "Coding Agent", "News monitoring", "Other"],
         ]
 
-        # 某些版本 Next 需要 textarea 非空（保险起见，自动填一句）
         def _ensure_textarea_filled() -> None:
             try:
                 ta = page.locator("textarea").first
@@ -1172,23 +576,19 @@ class ExaAutomation:
                         break
 
             _ensure_textarea_filled()
-
             next_btn = self._first_visible_locator(page, next_selectors)
             if next_btn is not None and next_btn.is_enabled():
                 next_btn.click()
                 page.wait_for_timeout(1200)
                 break
-
             page.wait_for_timeout(350)
 
-        # Step 2: 生成 key
         generate_selectors = [
             'button:has-text("Generate Code")',
             'button:has-text("Generate")',
             'button:has-text("Generate API Key")',
             '[role="button"]:has-text("Generate")',
         ]
-
         sign_in_selectors = [
             'button:has-text("Sign in for API key")',
             'a:has-text("Sign in for API key")',
@@ -1196,6 +596,7 @@ class ExaAutomation:
             'button:has-text("Go to Dashboard")',
             'a:has-text("Go to Dashboard")',
         ]
+
         generate_deadline = time.time() + 18.0
         while time.time() < generate_deadline and onboarding_key is None and "onboarding" in page.url:
             if self._click_any_visible(page, generate_selectors):
@@ -1206,7 +607,6 @@ class ExaAutomation:
                 _log("success", f"在 onboarding 页面直接提取到 API key: {onboarding_key[:6]}...{onboarding_key[-4:]}")
                 return onboarding_key
 
-            # 生成后常见会进入 "You're all set!" 页，需要点 "Sign in for API key" 才会离开 onboarding
             if self._click_any_visible(page, sign_in_selectors):
                 page.wait_for_timeout(1500)
                 if "onboarding" not in (page.url or ""):
@@ -1215,19 +615,14 @@ class ExaAutomation:
             onboarding_key = self._extract_first_uuid(page.inner_text("body"))
             if onboarding_key:
                 break
-
             page.wait_for_timeout(400)
 
-        # 兜底点一次 Sign in / Go to Dashboard
         if "onboarding" in (page.url or ""):
             if self._click_any_visible(page, sign_in_selectors):
                 page.wait_for_timeout(1500)
-
         return onboarding_key
 
     def _extract_onboarding_api_key(self, page) -> Optional[str]:
-        """在 onboarding 的 You're all set 页面直接提取 API key。"""
-        body_text = ""
         try:
             body_text = page.inner_text("body") or ""
         except Exception:
@@ -1285,17 +680,13 @@ class ExaAutomation:
                     return guessed
             except Exception:
                 pass
-
         return None
 
     def _redeem_coupon(self, page, coupon_code: str) -> Tuple[Optional[str], str]:
-        """兑换优惠券"""
         self._safe_goto(page, "https://dashboard.exa.ai/billing", timeout=self.timeout_ms, retries=1)
         page.wait_for_timeout(1200)
-
         coupon_status = "not_attempted"
         balance_before = self._read_balance(page)
-
         coupon_expand_selectors = [
             'button:has-text("Have a coupon")',
             'button:has-text("Add coupon")',
@@ -1313,7 +704,6 @@ class ExaAutomation:
         if coupon_input:
             coupon_input.fill(coupon_code)
             page.wait_for_timeout(250)
-
             redeem_btn_selectors = [
                 'button:has-text("Redeem")',
                 'button:has-text("Apply")',
@@ -1326,144 +716,20 @@ class ExaAutomation:
 
         balance = self._read_balance(page) or balance_before
         _log("success", f"优惠码状态: {coupon_status}, 余额: {balance}")
-
         return balance, coupon_status
 
-    def _create_api_key(self, page) -> str:
-        """创建 API Key"""
-        self._safe_goto(page, "https://dashboard.exa.ai/api-keys", timeout=self.timeout_ms, retries=1)
-        page.wait_for_timeout(1200)
-
-        # 有时会被重定向到登录/升级页面，先做兜底检查
-        current_url = page.url
-        if "auth.exa.ai" in current_url:
-            raise RuntimeError(f"API Keys 页面跳转到了登录页: {current_url}")
-
-        # Exa 前端可能改文案/按钮，增加多个选择器并给页面一些加载时间
-        create_selectors = [
-            'button:has-text("Create Key")',
-            'button:has-text("Create API Key")',
-            'button:has-text("New Key")',
-            'button:has-text("New API Key")',
-            'button:has-text("Create")',
-            '[role="button"]:has-text("Create Key")',
-            '[role="button"]:has-text("Create")',
-        ]
-
-        create_btn = None
-        deadline = time.time() + 12.0
-        while time.time() < deadline and create_btn is None:
-            for sel in create_selectors:
-                loc = page.locator(sel).first
-                if loc.count() and loc.is_visible():
-                    try:
-                        if loc.is_enabled():
-                            create_btn = loc
-                            break
-                    except Exception:
-                        # 某些 locator 上 is_enabled 可能抛错，忽略
-                        create_btn = loc
-                        break
-            if create_btn is None:
-                try:
-                    page.wait_for_load_state("domcontentloaded", timeout=1200)
-                except Exception:
-                    pass
-                page.wait_for_timeout(350)
-
-        if create_btn is None:
-            body = (page.inner_text("body") or "")
-            hint = body[:1200].replace("\n", " ")
-            raise RuntimeError(f"未找到 Create Key 按钮（URL={page.url}）。页面内容前1200字: {hint}")
-
-        create_btn.click()
-        page.wait_for_timeout(700)
-
-        # 名称输入框也可能改 placeholder，做兼容
-        name_input_selectors = [
-            'input[placeholder="Project name"]',
-            'input[placeholder*="name" i]',
-            'input[name*="name" i]',
-            'input[id*="name" i]',
-            'input[type="text"]',
-        ]
-        name_input = None
-        for sel in name_input_selectors:
-            loc = page.locator(sel).first
-            if loc.count() and loc.is_visible():
-                name_input = loc
-                break
-        if name_input is None:
-            raise RuntimeError("未找到 API key 名称输入框")
-        name_input.fill(f"pool-{int(time.time())}-{random.randint(100, 999)}")
-        page.wait_for_timeout(250)
-
-        confirm_selectors = [
-            'button:has-text("Create a Key")',
-            'button:has-text("Create Key")',
-            'button:has-text("Create")',
-            '[role="button"]:has-text("Create")',
-        ]
-        confirm_btn = None
-        for sel in confirm_selectors:
-            loc = page.locator(sel).first
-            if loc.count() and loc.is_visible():
-                confirm_btn = loc
-                break
-        if confirm_btn is None:
-            raise RuntimeError("未找到确认创建 Key 的按钮")
-        try:
-            if confirm_btn.is_enabled():
-                confirm_btn.click()
-            else:
-                raise RuntimeError("创建 Key 按钮不可用")
-        except Exception:
-            # 兜底：直接点击一次
-            confirm_btn.click()
-
-        # Key 展示方式可能是 readonly input / textarea / 或直接渲染在页面里
-        page.wait_for_timeout(1200)
-        key_value = ""
-        try:
-            key_loc = page.locator("input[readonly], textarea[readonly]").first
-            if key_loc.count() and key_loc.is_visible():
-                try:
-                    key_value = (key_loc.input_value() or "").strip()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        if not key_value:
-            # 从页面文本里直接抓 UUID（更稳）
-            extracted = self._extract_first_uuid(page.inner_text("body"))
-            key_value = extracted or ""
-
-        if not key_value or not UUID_RE.fullmatch(key_value):
-            body = (page.inner_text("body") or "")
-            hint = body[:1200].replace("\n", " ")
-            raise RuntimeError(f"创建后未提取到有效的 API key（URL={page.url}）。页面内容前1200字: {hint}")
-
-        self._click_if_visible(page, 'button:has-text("Done")') or \
-            self._click_if_visible(page, 'button:has-text("Close")')
-        page.wait_for_timeout(300)
-
-        _log("success", f"已提取 API key: {key_value[:6]}...{key_value[-4:]}")
-        return key_value
-
-    def _build_account_config(
-        self,
-        email: str,
-        api_key: str,
-        coupon_status: str,
-        balance: Optional[str],
-    ) -> Dict[str, Any]:
+    def _build_account_config(self, email: str, api_key: str, coupon_status: str, balance: Optional[str]) -> Dict[str, Any]:
         return {
             "id": email,
             "exa_api_key": api_key,
             "coupon_status": coupon_status,
             "balance": balance,
             "secure_c_ses": api_key,
+            "host_c_oses": "",
+            "csesidx": "exa",
+            "config_id": "exa",
+            "expires_at": None,
+            "disabled": False,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -1505,294 +771,150 @@ class ExaAutomation:
         return None
 
     def _safe_goto(self, page, url: str, timeout: Optional[int] = None, retries: int = 1) -> None:
-        """安全的页面跳转"""
         effective_timeout = timeout or self.timeout_ms
         for attempt in range(retries + 1):
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=effective_timeout)
                 return
-            except Exception as exc:
+            except Exception:
                 if attempt >= retries:
                     raise
                 _log("warning", f"页面跳转被中止，重试 {attempt + 1}/{retries}")
                 page.wait_for_timeout(500 + attempt * 300)
 
 
-# ==========================================
-# 主函数
-# ==========================================
-
-def create_mail_email(provider: str, proxies: Any = None, mail_domain: Optional[str] = None) -> Tuple[str, str]:
-    """创建邮箱并返回 (email, token_or_session)"""
-    provider = (provider or "").strip().lower()
-    if provider == "mailtm":
-        return get_email_and_token_mailtm(proxies, MAILTM_BASE)
-    if provider == "mailgw":
-        return get_email_and_token_mailtm(proxies, MAILGW_BASE)
-    if provider == "1secmail":
-        return get_email_1secmail(proxies)
-    if provider == "tempmailfree":
-        return get_email_temp_mailfree(proxies)
-    if provider == "dropmail":
-        return get_email_dropmail(proxies)
-    if provider == "imap":
-        if not mail_domain:
-            raise ValueError("provider=imap 时必须提供 --mail-domain")
-        return get_email_imap(mail_domain)
-    raise ValueError(f"不支持的邮箱提供商: {provider}")
+def normalize_success_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    exa_api_key = str(config.get("exa_api_key") or config.get("secure_c_ses") or "").strip()
+    account_id = str(config.get("id") or "").strip()
+    if not account_id or not exa_api_key:
+        return {}
+    return {
+        "id": account_id,
+        "exa_api_key": exa_api_key,
+        "coupon_status": config.get("coupon_status", "not_attempted"),
+        "balance": config.get("balance"),
+        "secure_c_ses": str(config.get("secure_c_ses") or exa_api_key),
+        "host_c_oses": config.get("host_c_oses", ""),
+        "csesidx": config.get("csesidx", "exa"),
+        "config_id": config.get("config_id", "exa"),
+        "expires_at": config.get("expires_at"),
+        "disabled": bool(config.get("disabled", False)),
+        "created_at": config.get("created_at"),
+    }
 
 
-def create_code_getter(provider: str, email: str, token_or_session: str, proxies: Any = None) -> callable:
-    """为指定的邮箱提供商创建验证码获取函数"""
-    provider = (provider or "").strip().lower()
-    if provider == "mailtm":
-        return lambda: get_oai_code_mailtm(email, token_or_session, proxies, MAILTM_BASE)
-    if provider == "mailgw":
-        return lambda: get_oai_code_mailtm(email, token_or_session, proxies, MAILGW_BASE)
-    if provider == "1secmail":
-        return lambda: get_oai_code_1secmail(email, proxies)
-    if provider == "tempmailfree":
-        return lambda: get_oai_code_temp_mailfree(email, token_or_session, proxies)
-    if provider == "dropmail":
-        return lambda: get_oai_code_dropmail(token_or_session, email, proxies)
-    if provider == "imap":
-        raise ValueError("provider=imap 需要单独的 IMAP 参数，当前脚本未开放自动轮换支持")
-    raise ValueError(f"不支持的邮箱提供商: {provider}")
+def create_mail_email(proxies: Any = None) -> Tuple[str, Any]:
+    return get_mailfree_email(proxies=proxies)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="ExaFree Exa 账号独立注册脚本（单文件版本）")
+def create_code_getter(email: str, token_or_session: Any, proxies: Any = None):
+    return lambda: get_exa_code_mailfree(email, token_or_session, proxies=proxies)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="ExaFree Exa 账号独立注册脚本（Mailfree 单文件版）")
     parser.add_argument("--coupon", default="", help="优惠码")
     parser.add_argument("--proxy", default="", help="代理地址，如 http://127.0.0.1:7890")
-    parser.add_argument("--provider", default="auto", help="邮箱提供商：auto|mailtm|mailgw|1secmail|tempmailfree|dropmail|imap")
-    parser.add_argument("--mail-domain", default="", help="邮箱域名（某些提供商适用）")
-    parser.add_argument(
-        "--output-dir", default="exak", help="Token 输出目录，默认 exak 目录（也可用环境变量 EXA_OUTPUT_DIR）"
-    )
-
-    # 循环次数与输出
-    parser.add_argument("--count", type=int, default=1, help="循环注册次数（也可用环境变量 EXA_COUNT）")
-    parser.add_argument("--output", default="", help="聚合输出文件路径（.json 或 .jsonl）。默认写入 output-dir 目录")
-    parser.add_argument("--jsonl", action="store_true", help="聚合输出为 JSON Lines（每行一个 JSON 对象）")
-    parser.add_argument("--save-each", action="store_true", help="每个账号单独再保存一份 json（兼容旧行为）")
-
-    # 关闭可视化（按你的要求固定 headless），仍保留 slowmo/pause 仅用于必要时临时排障
+    parser.add_argument("--output-dir", default="exak", help="输出目录，默认 exak")
+    parser.add_argument("--count", type=int, default=1, help="注册次数")
+    parser.add_argument("--output", default="", help="聚合输出文件路径（.json 或 .jsonl）")
+    parser.add_argument("--jsonl", action="store_true", help="聚合输出 JSONL")
+    parser.add_argument("--save-each", action="store_true", help="每个账号单独保存一份 json")
+    parser.add_argument("--headed", action="store_true", help="使用有头浏览器")
     parser.add_argument("--slowmo", type=int, default=0, help="每步操作延迟毫秒数（调试用）")
-    parser.add_argument("--pause-onboarding", action="store_true", help="在 onboarding 页面暂停，手动点选完成后继续（调试用）")
+    parser.add_argument("--pause-onboarding", action="store_true", help="在 onboarding 页面暂停（调试用）")
     args = parser.parse_args()
 
-    selected_provider = (os.getenv("MAIL_PROVIDER", "") or args.provider).strip().lower() or "auto"
-    provider_candidates = TEMP_MAIL_PROVIDER_ORDER[:] if selected_provider == "auto" else [selected_provider]
     coupon = (os.getenv("COUPON", "") or args.coupon).strip()
-    proxy = (os.getenv("EXA_PROXY", "") or args.proxy).strip()
-    mail_domain = (os.getenv("MAIL_DOMAIN", "") or args.mail_domain).strip() or None
+    proxy = _normalize_proxy(os.getenv("EXA_PROXY", "") or args.proxy)
+    count = max(1, int(os.getenv("EXA_COUNT", "") or args.count or 1))
 
-    # 输出目录：
-    # - 默认相对路径 exak（方便在 GitHub Actions 里用 artifacts 直接抓 exak/）
-    # - 若在 GitHub Actions 中无论从哪个子目录运行脚本，都强制基于 $GITHUB_WORKSPACE 解析
-    output_dir = (os.getenv("EXA_OUTPUT_DIR", "") or args.output_dir).strip() or "exak"
+    out_dir = (os.getenv("EXA_OUTPUT_DIR", "") or args.output_dir).strip() or "exak"
     base_dir = (os.getenv("GITHUB_WORKSPACE", "") or os.getcwd()).strip() or os.getcwd()
-    if os.path.isabs(output_dir):
-        out_dir = os.path.normpath(output_dir)
-    else:
-        out_dir = os.path.normpath(os.path.join(base_dir, output_dir))
-
-    def _display_path(path: str) -> str:
-        try:
-            # 能相对 workspace 展示就相对展示，避免日志里出现很长的 /home/runner/work/... 路径
-            rel = os.path.relpath(path, start=base_dir)
-            # relpath 可能生成 ".."，这种就直接回退到原路径
-            if rel.startswith(".."):
-                return path
-            return rel
-        except Exception:
-            return path
-
-    # 循环次数优先取环境变量，便于 GitHub Actions 设置
-    try:
-        count = int((os.getenv("EXA_COUNT", "") or "").strip() or int(args.count or 1))
-    except Exception:
-        count = int(args.count or 1)
-    count = max(1, count)
-
-    # 检查 proxy 协议
-    if proxy and "://" not in proxy:
-        if proxy.endswith(":1080"):
-            proxy = f"socks5h://{proxy}"
-        else:
-            proxy = f"http://{proxy}"
-
-    _log("info", f"========== Exa 单文件注册工具 v2.2 ==========")
-    _log("info", f"邮箱提供商: {', '.join(provider_candidates)}")
-    _log("info", f"代理: {proxy or '无'}")
-    _log("info", f"优惠码: {coupon or '不使用'}")
-    _log("info", f"输出目录: {_display_path(out_dir)}")
-    _log("info", f"循环次数: {count}")
-    if mail_domain:
-        _log("info", f"邮箱域名: {mail_domain}")
-
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-
-    # 输出目录与聚合文件路径
+    if not os.path.isabs(out_dir):
+        out_dir = os.path.normpath(os.path.join(base_dir, out_dir))
     os.makedirs(out_dir, exist_ok=True)
 
+    if not DEFAULT_WORKER_URL or not DEFAULT_MF_USER or not DEFAULT_MF_PASS:
+        raise SystemExit("缺少 Mailfree 配置，请在环境变量/Secrets 中设置 MF_WORKER_URL / MF_USER / MF_PASS")
+
+    proxies = {"http": proxy, "https": proxy} if proxy else None
     output_path = (args.output or "").strip()
     if not output_path and count > 1:
         suffix = "jsonl" if args.jsonl else "json"
         output_path = os.path.join(out_dir, f"exa_accounts_{int(time.time())}.{suffix}")
     elif output_path and not os.path.isabs(output_path):
-        # 相对路径统一基于 base_dir（GitHub Actions: $GITHUB_WORKSPACE；本地：cwd）
-        if os.path.dirname(output_path) == "":
-            # 仅文件名 -> 放到 output-dir
-            output_path = os.path.join(out_dir, output_path)
-        else:
-            # 带目录 -> 相对 base_dir
-            output_path = os.path.normpath(os.path.join(base_dir, output_path))
+        output_path = os.path.join(out_dir, output_path) if os.path.dirname(output_path) == "" else os.path.normpath(os.path.join(base_dir, output_path))
 
-    def _save_aggregate(records: List[Dict[str, Any]], path: str, *, jsonl: bool) -> None:
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8") as f:
-            if jsonl:
-                for row in records:
-                    f.write(json.dumps(row, ensure_ascii=False))
-                    f.write("\n")
-            else:
-                json.dump(records, f, indent=2, ensure_ascii=False)
+    _log("info", "========== Exa Mailfree 注册工具 ==========")
+    _log("info", f"代理: {proxy or '无'}")
+    _log("info", f"优惠码: {coupon or '不使用'}")
+    _log("info", f"输出目录: {out_dir}")
+    _log("info", f"循环次数: {count}")
 
-    def _extract_success_config_from_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if not isinstance(record, dict) or not record.get("success"):
-            return None
-        raw = record.get("raw") if isinstance(record.get("raw"), dict) else {}
-        config = raw.get("config") if isinstance(raw, dict) else None
-        if isinstance(config, dict):
-            return dict(config)
-        return None
-
-    def _extract_success_config(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if not isinstance(result, dict):
-            return None
-        config = result.get("config")
-        if not result.get("success") or not isinstance(config, dict):
-            return None
-        return dict(config)
-
-    all_records: List[Dict[str, Any]] = []
-
-    # 复用 automation（减少反复初始化配置），但每次仍会启动新的 browser
     automation = ExaAutomation(
         proxy=proxy,
         timeout_ms=120_000,
-        headed=False,
+        headed=bool(args.headed),
         slow_mo_ms=int(args.slowmo or 0),
         pause_onboarding=bool(args.pause_onboarding),
     )
 
+    all_configs: List[Dict[str, Any]] = []
+
     for i in range(count):
         _log("info", f"\n========== 第 {i + 1}/{count} 次注册 ==========")
-
         email = ""
-        raw_result: Dict[str, Any] = {}
-        provider_used = ""
+        try:
+            email, token_or_session = create_mail_email(proxies)
+            _log("success", f"Mailfree 邮箱创建成功: {email}")
+            get_code = create_code_getter(email, token_or_session, proxies)
 
-        for provider in provider_candidates:
-            provider_used = provider
-            _log("info", f"正在使用 {provider.upper()} 创建邮箱...")
-            try:
-                email, token_or_session = create_mail_email(provider, proxies, mail_domain)
-            except Exception as e:
-                _log("warning", f"{provider.upper()} 邮箱创建异常: {e}")
-                continue
-
-            if not email:
-                _log("warning", f"{provider.upper()} 邮箱创建失败")
-                continue
-
-            _log("success", f"邮箱创建成功: {email}")
-
-            try:
-                get_code = create_code_getter(provider, email, token_or_session, proxies)
-            except Exception as e:
-                _log("warning", f"{provider.upper()} 验证码获取器创建失败: {e}")
-                continue
-
-            _log("info", "开始 Exa 自动化注册...")
             result = automation.register_and_setup(
                 email=email,
                 code_getter_func=get_code,
                 coupon_code=coupon,
                 redeem_coupon=bool(coupon),
             )
-            raw_result = dict(result) if isinstance(result, dict) else {}
-            if raw_result.get("success"):
-                _log("success", f"{provider.upper()} 注册成功")
-                _log("success", f"API Key: {raw_result.get('created_api_key')}")
-                break
 
-            _log("warning", f"{provider.upper()} 注册失败: {raw_result.get('error', '未知错误')}")
+            if result.get("success"):
+                config = normalize_success_config(result.get("config") or {})
+                if config:
+                    all_configs.append(config)
+                    _log("success", f"注册成功: {email}")
+                    _log("success", f"API Key: {result.get('created_api_key')}")
+                else:
+                    _log("error", "注册成功但未生成有效配置")
+            else:
+                _log("error", f"注册失败: {result.get('error', '未知错误')}")
 
-        if not raw_result.get("success"):
-            raw_result.pop("config", None)
-            raw_result.pop("created_api_key", None)
-            raw_result.pop("onboarding_api_key", None)
-            raw_result.pop("balance", None)
-            raw_result.pop("coupon_status", None)
+            if (count == 1 or bool(args.save_each)) and result.get("success"):
+                payload = [normalize_success_config(result.get("config") or {})]
+                payload = [item for item in payload if item]
+                out_file = os.path.join(out_dir, f"exa_account_{email.split('@')[0]}_{int(time.time())}.json")
+                with open(out_file, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                    f.write("\n")
+                _log("success", f"账户信息已保存到: {out_file}")
+        except Exception as exc:
+            _log("error", f"处理 {email or 'mailfree'} 失败: {exc}")
 
-        record: Dict[str, Any] = {
-            "index": i + 1,
-            "provider": provider_used,
-            "email": email,
-            "success": bool(raw_result.get("success")),
-            "created_api_key": raw_result.get("created_api_key") if raw_result.get("success") else None,
-            "onboarding_api_key": raw_result.get("onboarding_api_key") if raw_result.get("success") else None,
-            "coupon_status": raw_result.get("coupon_status") if raw_result.get("success") else None,
-            "balance": raw_result.get("balance") if raw_result.get("success") else None,
-            "error": raw_result.get("error") or (f"全部邮箱提供商均失败: {', '.join(provider_candidates)}"),
-            "raw": raw_result,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        all_records.append(record)
-
-        if not raw_result.get("success"):
-            _log("error", "注册失败")
-            _log("error", f"错误: {record['error']}")
-
-        if (count == 1) or bool(args.save_each):
-            output_file = os.path.join(out_dir, f"exa_account_{(email.split('@')[0] if email else 'failed')}_{int(time.time())}.json")
-            try:
-                single_output = _extract_success_config(raw_result) or raw_result
-                with open(output_file, "w", encoding="utf-8") as f:
-                    json.dump(single_output, f, indent=2, ensure_ascii=False)
-                _log("success", f"账户信息已保存到: {output_file}")
-            except Exception as e:
-                _log("warning", f"保存单账号 JSON 失败: {e}")
-
-    # 写入聚合文件（count>1 默认输出；count==1 仅在显式指定 --output 或 --jsonl 时输出）
     if output_path:
-        try:
-            # 聚合输出必须是 Exa2api 可识别的账号配置数组（即 config 对象数组）
-            success_configs: List[Dict[str, Any]] = []
-            for row in all_records:
-                cfg = _extract_success_config_from_record(row)
-                if cfg:
-                    success_configs.append(cfg)
-            _save_aggregate(success_configs, output_path, jsonl=bool(args.jsonl) or output_path.lower().endswith(".jsonl"))
-            _log("success", f"\n聚合结果已保存到: {_display_path(output_path)}")
-        except Exception as e:
-            _log("error", f"聚合结果保存失败: {e}")
+        with open(output_path, "w", encoding="utf-8") as f:
+            if bool(args.jsonl) or output_path.lower().endswith(".jsonl"):
+                for row in all_configs:
+                    f.write(json.dumps(row, ensure_ascii=False))
+                    f.write("\n")
+            else:
+                json.dump(all_configs, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+        _log("success", f"聚合结果已保存到: {output_path}")
     elif count > 1:
-        # 理论上不会走到这里（count>1 会自动生成 output_path），兜底
         fallback = os.path.join(out_dir, f"exa_accounts_{int(time.time())}.json")
-        try:
-            success_configs: List[Dict[str, Any]] = []
-            for row in all_records:
-                cfg = _extract_success_config_from_record(row)
-                if cfg:
-                    success_configs.append(cfg)
-            _save_aggregate(success_configs, fallback, jsonl=False)
-            _log("success", f"\n聚合结果已保存到: {_display_path(fallback)}")
-        except Exception as e:
-            _log("error", f"聚合结果保存失败: {e}")
+        with open(fallback, "w", encoding="utf-8") as f:
+            json.dump(all_configs, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        _log("success", f"聚合结果已保存到: {fallback}")
 
 
 if __name__ == "__main__":
