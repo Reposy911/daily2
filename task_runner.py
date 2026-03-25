@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+ExaFree Exa 账号独立注册脚本（单文件版本）
 集成了所有邮箱验证码获取逻辑，支持多个邮箱提供商
 使用方法：
    python standalone_exa_register_unified.py [--provider duckmail] [--coupon CODE]
@@ -76,7 +77,9 @@ UUID_RE = re.compile(
 # 验证码正则
 CODE_REGEX = r"(?<!\d)(\d{6})(?!\d)"
 MAILTM_BASE = "https://api.mail.tm"
+MAILGW_BASE = "https://api.mail.gw"
 TEMPMAILFREE_BASE = "https://api.temp-mail.solutions"
+TEMP_MAIL_PROVIDER_ORDER = ["mailtm", "mailgw", "1secmail", "tempmailfree", "dropmail"]
 
 # 某些临时邮箱域名可能在目标站点不可用/收不到信，可在这里禁用
 # 也可用环境变量追加禁用：set MAIL_DOMAIN_BLOCKLIST=foo.com,bar.com
@@ -1443,20 +1446,47 @@ class ExaAutomation:
 
 def create_mail_email(provider: str, proxies: Any = None, mail_domain: Optional[str] = None) -> Tuple[str, str]:
     """创建邮箱并返回 (email, token_or_session)"""
-    # 仅使用 dropmail（按你的要求固定 provider，避免其它邮箱域名不稳定影响流程）
-    return get_email_dropmail(proxies)
+    provider = (provider or "").strip().lower()
+    if provider == "mailtm":
+        return get_email_and_token_mailtm(proxies, MAILTM_BASE)
+    if provider == "mailgw":
+        return get_email_and_token_mailtm(proxies, MAILGW_BASE)
+    if provider == "1secmail":
+        return get_email_1secmail(proxies)
+    if provider == "tempmailfree":
+        return get_email_temp_mailfree(proxies)
+    if provider == "dropmail":
+        return get_email_dropmail(proxies)
+    if provider == "imap":
+        if not mail_domain:
+            raise ValueError("provider=imap 时必须提供 --mail-domain")
+        return get_email_imap(mail_domain)
+    raise ValueError(f"不支持的邮箱提供商: {provider}")
 
 
 def create_code_getter(provider: str, email: str, token_or_session: str, proxies: Any = None) -> callable:
     """为指定的邮箱提供商创建验证码获取函数"""
-    # 仅使用 dropmail
-    return lambda: get_oai_code_dropmail(token_or_session, email, proxies)
+    provider = (provider or "").strip().lower()
+    if provider == "mailtm":
+        return lambda: get_oai_code_mailtm(email, token_or_session, proxies, MAILTM_BASE)
+    if provider == "mailgw":
+        return lambda: get_oai_code_mailtm(email, token_or_session, proxies, MAILGW_BASE)
+    if provider == "1secmail":
+        return lambda: get_oai_code_1secmail(email, proxies)
+    if provider == "tempmailfree":
+        return lambda: get_oai_code_temp_mailfree(email, token_or_session, proxies)
+    if provider == "dropmail":
+        return lambda: get_oai_code_dropmail(token_or_session, email, proxies)
+    if provider == "imap":
+        raise ValueError("provider=imap 需要单独的 IMAP 参数，当前脚本未开放自动轮换支持")
+    raise ValueError(f"不支持的邮箱提供商: {provider}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="ExaFree Exa 账号独立注册脚本（单文件版本）")
     parser.add_argument("--coupon", default="", help="优惠码")
     parser.add_argument("--proxy", default="", help="代理地址，如 http://127.0.0.1:7890")
+    parser.add_argument("--provider", default="auto", help="邮箱提供商：auto|mailtm|mailgw|1secmail|tempmailfree|dropmail|imap")
     parser.add_argument("--mail-domain", default="", help="邮箱域名（某些提供商适用）")
     parser.add_argument(
         "--output-dir", default="exak", help="Token 输出目录，默认 exak 目录（也可用环境变量 EXA_OUTPUT_DIR）"
@@ -1473,8 +1503,8 @@ def main():
     parser.add_argument("--pause-onboarding", action="store_true", help="在 onboarding 页面暂停，手动点选完成后继续（调试用）")
     args = parser.parse_args()
 
-    # 固定只使用 dropmail
-    provider = "dropmail"
+    selected_provider = (os.getenv("MAIL_PROVIDER", "") or args.provider).strip().lower() or "auto"
+    provider_candidates = TEMP_MAIL_PROVIDER_ORDER[:] if selected_provider == "auto" else [selected_provider]
     coupon = (os.getenv("COUPON", "") or args.coupon).strip()
     proxy = (os.getenv("EXA_PROXY", "") or args.proxy).strip()
     mail_domain = (os.getenv("MAIL_DOMAIN", "") or args.mail_domain).strip() or None
@@ -1515,7 +1545,7 @@ def main():
             proxy = f"http://{proxy}"
 
     _log("info", f"========== Exa 单文件注册工具 v2.2 ==========")
-    _log("info", f"邮箱提供商: {provider}")
+    _log("info", f"邮箱提供商: {', '.join(provider_candidates)}")
     _log("info", f"代理: {proxy or '无'}")
     _log("info", f"优惠码: {coupon or '不使用'}")
     _log("info", f"输出目录: {_display_path(out_dir)}")
@@ -1583,36 +1613,46 @@ def main():
     for i in range(count):
         _log("info", f"\n========== 第 {i + 1}/{count} 次注册 ==========")
 
-        # 创建邮箱
-        _log("info", f"正在使用 {provider.upper()} 创建邮箱...")
-        email, token_or_session = create_mail_email(provider, proxies, mail_domain)
+        email = ""
+        raw_result: Dict[str, Any] = {}
+        provider_used = ""
 
-        if not email:
-            _log("error", f"{provider.upper()} 邮箱创建失败")
-            record = {
-                "index": i + 1,
-                "success": False,
-                "error": f"{provider.upper()} 邮箱创建失败",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-            all_records.append(record)
-            continue
+        for provider in provider_candidates:
+            provider_used = provider
+            _log("info", f"正在使用 {provider.upper()} 创建邮箱...")
+            try:
+                email, token_or_session = create_mail_email(provider, proxies, mail_domain)
+            except Exception as e:
+                _log("warning", f"{provider.upper()} 邮箱创建异常: {e}")
+                continue
 
-        _log("success", f"邮箱创建成功: {email}")
+            if not email:
+                _log("warning", f"{provider.upper()} 邮箱创建失败")
+                continue
 
-        # 创建验证码获取函数
-        get_code = create_code_getter(provider, email, token_or_session, proxies)
+            _log("success", f"邮箱创建成功: {email}")
 
-        # 执行 Exa 注册
-        _log("info", "开始 Exa 自动化注册...")
-        result = automation.register_and_setup(
-            email=email,
-            code_getter_func=get_code,
-            coupon_code=coupon,
-            redeem_coupon=bool(coupon),
-        )
+            try:
+                get_code = create_code_getter(provider, email, token_or_session, proxies)
+            except Exception as e:
+                _log("warning", f"{provider.upper()} 验证码获取器创建失败: {e}")
+                continue
 
-        raw_result: Dict[str, Any] = dict(result) if isinstance(result, dict) else {}
+            _log("info", "开始 Exa 自动化注册...")
+            result = automation.register_and_setup(
+                email=email,
+                code_getter_func=get_code,
+                coupon_code=coupon,
+                redeem_coupon=bool(coupon),
+            )
+            raw_result = dict(result) if isinstance(result, dict) else {}
+            if raw_result.get("success"):
+                _log("success", f"{provider.upper()} 注册成功")
+                _log("success", f"API Key: {raw_result.get('created_api_key')}")
+                break
+
+            _log("warning", f"{provider.upper()} 注册失败: {raw_result.get('error', '未知错误')}")
+
         if not raw_result.get("success"):
             raw_result.pop("config", None)
             raw_result.pop("created_api_key", None)
@@ -1622,28 +1662,25 @@ def main():
 
         record: Dict[str, Any] = {
             "index": i + 1,
+            "provider": provider_used,
             "email": email,
             "success": bool(raw_result.get("success")),
             "created_api_key": raw_result.get("created_api_key") if raw_result.get("success") else None,
             "onboarding_api_key": raw_result.get("onboarding_api_key") if raw_result.get("success") else None,
             "coupon_status": raw_result.get("coupon_status") if raw_result.get("success") else None,
             "balance": raw_result.get("balance") if raw_result.get("success") else None,
-            "error": raw_result.get("error"),
+            "error": raw_result.get("error") or (f"全部邮箱提供商均失败: {', '.join(provider_candidates)}"),
             "raw": raw_result,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         all_records.append(record)
 
-        if result.get("success"):
-            _log("success", "注册成功")
-            _log("success", f"API Key: {result.get('created_api_key')}")
-        else:
+        if not raw_result.get("success"):
             _log("error", "注册失败")
-            _log("error", f"错误: {result.get('error', '未知错误')}")
+            _log("error", f"错误: {record['error']}")
 
-        # 兼容旧行为：单次时默认保存单账号 json；多次时仅在 --save-each 时保存
         if (count == 1) or bool(args.save_each):
-            output_file = os.path.join(out_dir, f"exa_account_{email.split('@')[0]}_{int(time.time())}.json")
+            output_file = os.path.join(out_dir, f"exa_account_{(email.split('@')[0] if email else 'failed')}_{int(time.time())}.json")
             try:
                 single_output = _extract_success_config(raw_result) or raw_result
                 with open(output_file, "w", encoding="utf-8") as f:
