@@ -2,7 +2,7 @@ name: Daily Task Job
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '*/40 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -22,14 +22,16 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
-
+      
       - name: Install Chrome
         run: python -m playwright install chromium
-        
+
       - name: Run registration
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
           mkdir -p exak
-          python task_runner.py --count 50 || true
+          python -u task_runner.py --count 50 2>&1 | tee exak/run.log || true
 
       - name: Upload tokens
         if: always()
