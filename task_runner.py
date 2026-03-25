@@ -998,19 +998,97 @@ class ExaAutomation:
         auth_url = "https://auth.exa.ai/?callbackUrl=https%3A%2F%2Fdashboard.exa.ai%2F"
         page.goto(auth_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
 
+        def _page_diag() -> str:
+            try:
+                title = page.title() or ""
+            except Exception:
+                title = ""
+            try:
+                body = (page.inner_text("body") or "")[:1000].replace("\n", " ")
+            except Exception:
+                body = ""
+            try:
+                email_visible = bool(page.locator('input[placeholder="Email"]').first.is_visible())
+            except Exception:
+                email_visible = False
+            try:
+                otp_visible = bool(page.locator('input[placeholder="Enter verification code"]').first.is_visible())
+            except Exception:
+                otp_visible = False
+            try:
+                submit_visible = bool(page.locator('form:has(input[placeholder="Email"]) button[type="submit"]').first.is_visible())
+            except Exception:
+                submit_visible = False
+            return (
+                f"url={page.url} | title={title[:120]} | email_input={email_visible} | "
+                f"otp_input={otp_visible} | submit_btn={submit_visible} | body={body[:600]}"
+            )
+
         page.wait_for_selector('input[placeholder="Email"]', timeout=60_000)
         page.fill('input[placeholder="Email"]', email)
         page.locator('form:has(input[placeholder="Email"]) button[type="submit"]').first.click()
 
-        page.wait_for_selector('text="Verify your email"', timeout=60_000)
+        otp_ready = False
+        entered_dashboard = False
+        deadline = time.time() + 60.0
+        otp_markers = [
+            "verify your email",
+            "verification code",
+            "enter verification code",
+            "check your inbox",
+            "enter code",
+        ]
+
+        while time.time() < deadline:
+            current_url = page.url or ""
+            current_host = urlparse(current_url).hostname or ""
+            if current_host == "dashboard.exa.ai":
+                entered_dashboard = True
+                break
+            if "dashboard.exa.ai/onboarding" in current_url or "onboarding" in current_url:
+                entered_dashboard = True
+                break
+
+            try:
+                otp_input = page.locator('input[placeholder="Enter verification code"]').first
+                if otp_input.count() and otp_input.is_visible():
+                    otp_ready = True
+                    break
+            except Exception:
+                pass
+
+            try:
+                body_text = (page.inner_text("body") or "").lower()
+            except Exception:
+                body_text = ""
+            if any(marker in body_text for marker in otp_markers):
+                otp_ready = True
+                break
+
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=1200)
+            except Exception:
+                pass
+            page.wait_for_timeout(300)
+
+        if not otp_ready and not entered_dashboard:
+            raise RuntimeError(
+                "提交邮箱后未进入验证码页。"
+                + _page_diag()
+            )
+
+        if entered_dashboard:
+            _log("success", f"提交邮箱后已直接进入: {page.url}")
+            return
+
         _log("info", "等待验证码邮件...")
-        
         code = code_getter_func()
         if not code:
             raise RuntimeError("未收到 Exa OTP 验证码")
         _log("success", f"收到 OTP: {code}")
 
-        page.fill('input[placeholder="Enter verification code"]', code)
+        otp_input = page.locator('input[placeholder="Enter verification code"]').first
+        otp_input.fill(code)
         page.locator('button:has-text("VERIFY CODE")').first.click()
 
         entered_dashboard = False
@@ -1076,7 +1154,7 @@ class ExaAutomation:
                     except Exception:
                         current = ""
                     if not current:
-                        ta.fill("CTF setup")
+                        ta.fill("websearch setup")
                         page.wait_for_timeout(150)
             except Exception:
                 return
